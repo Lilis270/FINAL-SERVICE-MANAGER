@@ -44,6 +44,8 @@ export default function Layout() {
   const [results, setResults] = useState({ customers: [], services: [] });
   const [notif, setNotif] = useState({});
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (!user) return;
     let alive = true;

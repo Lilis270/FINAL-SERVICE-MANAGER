@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 
 export default function AuditLogs() {
   const [logs, setLogs] = useState([]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { api.get("/audit-logs").then((r) => setLogs(r.data)); }, []);
 
   return (

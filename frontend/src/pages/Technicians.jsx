@@ -25,6 +25,7 @@ export default function Technicians() {
     setItems((await api.get("/technicians")).data);
     try { setUsers((await api.get("/users")).data.filter(u => u.role === "teknisi")); } catch (e) { /* ignore */ }
   };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
   const startEdit = (t) => {

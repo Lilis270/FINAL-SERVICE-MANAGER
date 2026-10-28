@@ -19,7 +19,8 @@ export default function Suppliers() {
   const [editingId, setEditingId] = useState(null);
 
   const load = async () => setItems((await api.get("/suppliers")).data);
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { load();  }, []);
 
   const save = async () => {
     try {

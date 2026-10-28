@@ -18,6 +18,7 @@ export default function MyJobs() {
     const r = await api.get(`/my-jobs?period=${period}`); setItems(r.data);
     const p = await api.get(`/services?status=Menunggu Teknisi`); setPending(p.data);
   };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [period]);
 
   const claim = async (id) => {

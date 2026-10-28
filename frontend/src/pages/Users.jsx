@@ -21,7 +21,8 @@ export default function Users() {
   const [form, setForm] = useState(empty);
 
   const load = async () => setUsers((await api.get("/users")).data);
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { load();  }, []);
 
   const isAdmin = me?.role === "admin";
   const save = async () => {

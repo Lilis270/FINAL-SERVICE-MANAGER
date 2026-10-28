@@ -9,6 +9,7 @@ import { toast } from "sonner";
 export default function UserApprovals() {
   const [items, setItems] = useState([]);
   const load = async () => { try { setItems((await api.get("/user-change-requests")).data); } catch(e){} };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, []);
   const act = async (id, action) => {
     try { await api.post(`/user-change-requests/${id}/${action}`); toast.success(action); load(); }

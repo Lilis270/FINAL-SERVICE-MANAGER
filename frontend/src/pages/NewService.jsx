@@ -25,6 +25,8 @@ export default function NewService() {
   });
   const navigate = useNavigate();
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   useEffect(() => { api.get("/customers").then((r) => setCustomers(r.data)); }, []);
 
   const toggleAcc = (a) => {

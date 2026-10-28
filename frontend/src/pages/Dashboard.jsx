@@ -27,6 +27,8 @@ const StatCard = ({ icon: Icon, label, value, accent, sub, testid }) => (
 export default function Dashboard() {
   const [stats, setStats] = useState(null);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     api.get("/dashboard/stats").then((r) => setStats(r.data));
   }, []);

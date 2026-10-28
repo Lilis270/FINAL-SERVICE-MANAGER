@@ -7,30 +7,69 @@ load_dotenv(ROOT_DIR / '.env')
 import os
 import asyncio
 import logging
+import math
 import secrets
 import uuid
 import bcrypt
 import jwt
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends, Query
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
+from fastapi.middleware.cors import CORSMiddleware
+
+origins = [
+    "http://localhost:3000",
+    os.getenv("FRONTEND_URL", ""),
+]
+
 # ---------- Setup ----------
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+mongo_url = os.getenv("MONGO_URL")
+if not mongo_url:
+    raise RuntimeError("MONGO_URL belum disetel")
+    
+client = AsyncIOMotorClient(
+    mongo_url,
+    serverSelectionTimeoutMS=5000
+)
+
+db = client[os.getenv("DB_NAME")]
+if db is None:
+    raise Exception("Database gagal")
 
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.environ['JWT_SECRET']
+
+JWT_SECRET = os.getenv("JWT_SECRET")
+if JWT_SECRET is None:
+    raise Exception("JWT_SECRET belum disetel")
 
 app = FastAPI(title="Service HP Manager API")
 api = APIRouter(prefix="/api")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Allow origins: include FRONTEND_URL (from env) plus common localdev hosts
+_allowed_origins = [o for o in origins if o]
+for _loc in ("http://localhost:3000", "http://localhost:5173"):
+    if _loc not in _allowed_origins:
+        _allowed_origins.append(_loc)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
 logger = logging.getLogger("service-hp")
 
 # ---------- Helpers ----------
@@ -47,6 +86,23 @@ def create_access_token(user_id: str, email: str, role: str) -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def calculate_service_profit(service: dict) -> float:
+    service_fee = service.get("service_fee", service.get("estimated_cost", 0) or 0) or 0
+    final_cost = service.get("final_cost")
+    if final_cost is None:
+        final_cost = service_fee + sum(
+            (item.get("price", 0) or 0) * (item.get("qty", 0) or 0)
+            for item in service.get("items_used", [])
+        )
+    return (final_cost or 0) - (service.get("sparepart_cost", 0) or 0)
+
+def completed_date_filter(start: str, end: str) -> dict:
+    date_range = {"$gte": start, "$lte": end + "T23:59:59.999999"}
+    return {"$or": [
+        {"completed_at": date_range},
+        {"completed_at": {"$in": [None, ""]}, "created_at": date_range},
+    ]}
 
 def gen_id() -> str:
     return str(uuid.uuid4())
@@ -199,6 +255,10 @@ class PaymentIn(BaseModel):
     type: Literal["dp", "pelunasan", "full"]
     note: Optional[str] = ""
 
+class PaymentAmountUpdate(BaseModel):
+    amount: float
+    supervisor_password: str
+
 class PickupIn(BaseModel):
     unit_ok: bool
     paid: bool
@@ -302,6 +362,7 @@ class SettingsIn(BaseModel):
     printer_font_family: Optional[str] = None     # "mono" | "sans"
     printer_hide_borders: Optional[bool] = None   # true = remove borders for thermal
     printer_cut_command: Optional[str] = None     # future: escpos hex
+    printout_settings: Optional[Dict[str, Dict[str, Any]]] = None
 
 SERVICE_STATUSES = [
     "Menunggu Teknisi", "Menunggu Diagnosa", "Sedang Diagnosa", "Menunggu Persetujuan",
@@ -536,9 +597,14 @@ async def update_status(sid: str, data: StatusUpdate, user: dict = Depends(requi
         raise HTTPException(400, "Status tidak valid")
     s = await db.services.find_one({"id": sid})
     if not s: raise HTTPException(404)
+    status_at = now_iso()
     history = s.get("status_history", [])
-    history.append({"status": data.status, "note": data.note or "", "by": user["name"], "at": now_iso()})
-    update = {"status": data.status, "status_history": history, "updated_at": now_iso()}
+    history.append({"status": data.status, "note": data.note or "", "by": user["name"], "at": status_at})
+    update = {"status": data.status, "status_history": history, "updated_at": status_at}
+    if data.status in ("Selesai", "Sudah Diambil"):
+        update["profit"] = calculate_service_profit(s)
+        if s.get("status") not in ("Selesai", "Sudah Diambil") or not s.get("completed_at"):
+            update["completed_at"] = status_at
 
     # If cancelled, handle sparepart choice
     if data.status == "Dibatalkan":
@@ -757,9 +823,12 @@ async def submit_qc(sid: str, data: QCCheckIn, user: dict = Depends(require_role
 
     history = s.get("status_history", [])
     if all_ok:
-        history.append({"status": "Selesai", "note": "QC PASS - siap diambil", "by": user["name"], "at": now_iso()})
+        completed_at = now_iso()
+        history.append({"status": "Selesai", "note": "QC PASS - siap diambil", "by": user["name"], "at": completed_at})
         update = {
             "status": "Selesai",
+            "completed_at": completed_at,
+            "profit": calculate_service_profit(s),
             "qc_result": qc_result,
             "qc_history": qc_history,
             "qc_passed": True,
@@ -819,6 +888,95 @@ async def create_payment(data: PaymentIn, user: dict = Depends(require_roles("ka
     await db.services.update_one({"id": data.service_id}, {"$set": {"total_paid": total_paid}})
     await audit(user, "payment", "service", data.service_id, {"amount": data.amount})
     return pay
+
+@api.patch("/payments/{payment_id}/amount")
+async def update_payment_amount(
+    payment_id: str,
+    data: PaymentAmountUpdate,
+    request: Request,
+    user: dict = Depends(require_roles("kasir", "admin", "owner")),
+):
+    if not math.isfinite(data.amount) or data.amount <= 0:
+        raise HTTPException(400, "Jumlah pembayaran harus lebih dari 0")
+    if not data.supervisor_password or len(data.supervisor_password.encode("utf-8")) > 72:
+        raise HTTPException(403, "Password owner/admin tidak valid")
+
+    ip = request.client.host if request.client else ""
+    attempt_key = f"payment-edit:{ip}:{user['id']}"
+    attempts = await db.login_attempts.find_one({"identifier": attempt_key})
+    if attempts and attempts.get("count", 0) >= 5:
+        last = datetime.fromisoformat(attempts["last_at"])
+        if datetime.now(timezone.utc) - last < timedelta(minutes=15):
+            raise HTTPException(429, "Terlalu banyak percobaan. Coba lagi nanti.")
+        await db.login_attempts.delete_one({"identifier": attempt_key})
+
+    supervisors = await db.users.find(
+        {"role": {"$in": ["owner", "admin"]}, "active": {"$ne": False}},
+        {"_id": 0, "id": 1, "name": 1, "role": 1, "password_hash": 1},
+    ).to_list(100)
+    authorized_by = None
+    for supervisor in supervisors:
+        password_hash = supervisor.get("password_hash", "")
+        try:
+            if password_hash and verify_password(data.supervisor_password, password_hash):
+                authorized_by = supervisor
+                break
+        except (TypeError, ValueError):
+            continue
+    if not authorized_by:
+        await db.login_attempts.update_one(
+            {"identifier": attempt_key},
+            {"$inc": {"count": 1}, "$set": {"last_at": now_iso()}},
+            upsert=True,
+        )
+        raise HTTPException(403, "Password owner/admin tidak valid")
+
+    await db.login_attempts.delete_one({"identifier": attempt_key})
+    payment = await db.payments.find_one({"id": payment_id})
+    if not payment:
+        raise HTTPException(404, "Pembayaran tidak ditemukan")
+    service = await db.services.find_one({"id": payment.get("service_id")})
+    if not service:
+        raise HTTPException(404, "Service pembayaran tidak ditemukan")
+
+    old_amount = payment.get("amount", 0) or 0
+    delta = data.amount - old_amount
+    updated_at = now_iso()
+    result = await db.payments.update_one(
+        {"id": payment_id, "amount": old_amount},
+        {"$set": {
+            "amount": data.amount,
+            "amount_updated_at": updated_at,
+            "amount_updated_by": user["name"],
+            "amount_authorized_by": authorized_by["name"],
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(409, "Pembayaran berubah. Muat ulang sebelum mencoba lagi")
+
+    await db.services.update_one({"id": service["id"]}, {"$inc": {"total_paid": delta}})
+    await audit(
+        user,
+        "payment_amount_update",
+        "payment",
+        payment_id,
+        {
+            "service_id": service["id"],
+            "old_amount": old_amount,
+            "new_amount": data.amount,
+            "authorized_by": {
+                "id": authorized_by["id"],
+                "name": authorized_by["name"],
+                "role": authorized_by["role"],
+            },
+        },
+    )
+    payment["amount"] = data.amount
+    payment["amount_updated_at"] = updated_at
+    payment["amount_updated_by"] = user["name"]
+    payment["amount_authorized_by"] = authorized_by["name"]
+    payment.pop("_id", None)
+    return payment
 
 # ---------- TECHNICIANS / JOB ASSIGNMENT / FINANCIAL ----------
 class SparepartCategoryIn(BaseModel):
@@ -1061,8 +1219,11 @@ async def financial_report(start: Optional[str] = None, end: Optional[str] = Non
     end_dt = end + "T23:59:59"
     pays = await db.payments.find({"created_at": {"$gte": start, "$lte": end_dt}}, {"_id": 0}).to_list(10000)
     svcs = await db.services.find({"created_at": {"$gte": start, "$lte": end_dt}}, {"_id": 0}).to_list(10000)
+    completed_svcs = await db.services.find({
+        "status": {"$in": ["Selesai", "Sudah Diambil"]}, **completed_date_filter(start, end)
+    }, {"_id": 0}).to_list(10000)
     omzet = sum(p["amount"] for p in pays)
-    laba = sum(s.get("profit", 0) or 0 for s in svcs if s.get("status") in ["Selesai", "Sudah Diambil"])
+    laba = sum(s.get("profit", 0) or 0 for s in completed_svcs)
     modal = sum(s.get("sparepart_cost", 0) or 0 for s in svcs)
     dp_total = sum(p["amount"] for p in pays if p.get("type") == "dp")
     piutang = sum(max(0, (s.get("final_cost", 0) - s.get("total_paid", 0))) for s in svcs if s.get("status") != "Dibatalkan")
@@ -1098,7 +1259,6 @@ async def report_technicians(user: dict = Depends(require_roles("owner", "admin"
 async def report_technicians_profit(start: Optional[str] = None, end: Optional[str] = None, technician_id: Optional[str] = None, user: dict = Depends(require_roles("owner", "admin"))):
     if not start: start = datetime.now(timezone.utc).strftime("%Y-%m-01")
     if not end: end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    end_dt = end + "T23:59:59"
     techs = await db.technicians.find({}, {"_id": 0}).to_list(500)
     if technician_id:
         techs = [t for t in techs if t["id"] == technician_id]
@@ -1107,7 +1267,7 @@ async def report_technicians_profit(start: Optional[str] = None, end: Optional[s
         svcs = await db.services.find({
             "assigned_technician_id": t["id"],
             "status": {"$in": ["Selesai", "Sudah Diambil"]},
-            "created_at": {"$gte": start, "$lte": end_dt},
+            **completed_date_filter(start, end),
         }, {"_id": 0}).to_list(2000)
         pct = t.get("commission_percent", 0) / 100
         detail = []
@@ -1125,6 +1285,7 @@ async def report_technicians_profit(start: Optional[str] = None, end: Optional[s
                 "brand": s.get("brand"),
                 "model": s.get("model"),
                 "created_at": s.get("created_at"),
+                "completed_at": s.get("completed_at") or s.get("created_at"),
                 "final_cost": s.get("final_cost", 0) or 0,
                 "service_fee": fee,
                 "commission": comm,
@@ -1146,12 +1307,11 @@ async def report_technicians_profit(start: Optional[str] = None, end: Optional[s
 async def technician_salary_slip(tid: str, start: str, end: str, user: dict = Depends(require_roles("owner", "admin"))):
     tech = await db.technicians.find_one({"id": tid}, {"_id": 0})
     if not tech: raise HTTPException(404, "Teknisi tidak ditemukan")
-    end_dt = end + "T23:59:59"
     svcs = await db.services.find({
         "assigned_technician_id": tid,
         "status": {"$in": ["Selesai", "Sudah Diambil"]},
-        "created_at": {"$gte": start, "$lte": end_dt},
-    }, {"_id": 0}).sort("created_at", 1).to_list(2000)
+        **completed_date_filter(start, end),
+    }, {"_id": 0}).sort("completed_at", 1).to_list(2000)
     pct = tech.get("commission_percent", 0) / 100
     detail = []
     total_fee = 0
@@ -1163,7 +1323,7 @@ async def technician_salary_slip(tid: str, start: str, end: str, user: dict = De
         total_commission += comm
         detail.append({
             "service_number": s.get("service_number"),
-            "date": s.get("created_at"),
+            "date": s.get("completed_at") or s.get("created_at"),
             "customer_name": s.get("customer_name"),
             "brand_model": f"{s.get('brand','')} {s.get('model','')}".strip(),
             "service_fee": fee,
@@ -1445,11 +1605,16 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
     payments_month = await db.payments.find({"created_at": {"$regex": f"^{month}"}}, {"_id": 0}).to_list(5000)
     revenue_month = sum(p["amount"] for p in payments_month)
 
-    # Profit stats
-    today_svcs = await db.services.find({"created_at": {"$regex": f"^{today}"}}, {"_id": 0}).to_list(2000)
-    month_svcs = await db.services.find({"created_at": {"$regex": f"^{month}"}}, {"_id": 0}).to_list(5000)
-    profit_today = sum(s.get("profit", 0) or 0 for s in today_svcs if s.get("status") in ["Selesai", "Sudah Diambil"])
-    profit_month = sum(s.get("profit", 0) or 0 for s in month_svcs if s.get("status") in ["Selesai", "Sudah Diambil"])
+    # Profit stats follow the date the service was completed, not when it was created.
+    completed_statuses = ["Selesai", "Sudah Diambil"]
+    today_svcs = await db.services.find({
+        "status": {"$in": completed_statuses}, **completed_date_filter(today, today)
+    }, {"_id": 0}).to_list(2000)
+    month_svcs = await db.services.find({
+        "status": {"$in": completed_statuses}, **completed_date_filter(month + "-01", today)
+    }, {"_id": 0}).to_list(5000)
+    profit_today = sum(s.get("profit", 0) or 0 for s in today_svcs)
+    profit_month = sum(s.get("profit", 0) or 0 for s in month_svcs)
 
     # Top technicians (by profit)
     techs = await db.technicians.find({}, {"_id": 0}).to_list(100)
@@ -1863,7 +2028,7 @@ async def export_report(
             svcs = await db.services.find({
                 "assigned_technician_id": t["id"],
                 "status": {"$in": ["Selesai", "Sudah Diambil"]},
-                "created_at": {"$gte": start, "$lte": end_dt},
+                **completed_date_filter(start, end),
             }, {"_id": 0}).to_list(2000)
             pct = t.get("commission_percent", 0) / 100
             total_fee = sum(s.get("service_fee", s.get("estimated_cost", 0) or 0) or 0 for s in svcs)
@@ -1882,8 +2047,8 @@ async def export_report(
         svcs = await db.services.find({
             "assigned_technician_id": technician_id,
             "status": {"$in": ["Selesai", "Sudah Diambil"]},
-            "created_at": {"$gte": start, "$lte": end_dt},
-        }, {"_id": 0}).sort("created_at", 1).to_list(2000)
+            **completed_date_filter(start, end),
+        }, {"_id": 0}).sort("completed_at", 1).to_list(2000)
         title = f"Slip Gaji Teknisi — {tech['name']}"
         meta["Teknisi"] = tech["name"]
         meta["Persen Komisi"] = f"{tech.get('commission_percent',0)}%"
@@ -1896,7 +2061,7 @@ async def export_report(
             total_fee += fee
             total_comm += comm
             rows.append([
-                (s.get("created_at") or "")[:10],
+                (s.get("completed_at") or s.get("created_at") or "")[:10],
                 s.get("service_number", ""),
                 s.get("customer_name", ""),
                 f"{s.get('brand','')} {s.get('model','')}".strip(),
@@ -1911,8 +2076,11 @@ async def export_report(
     elif type == "financial":
         pays = await db.payments.find({"created_at": {"$gte": start, "$lte": end_dt}}, {"_id": 0}).to_list(10000)
         svcs = await db.services.find({"created_at": {"$gte": start, "$lte": end_dt}}, {"_id": 0}).to_list(10000)
+        completed_svcs = await db.services.find({
+            "status": {"$in": ["Selesai", "Sudah Diambil"]}, **completed_date_filter(start, end)
+        }, {"_id": 0}).to_list(10000)
         omzet = sum(p["amount"] for p in pays)
-        laba = sum(s.get("profit", 0) or 0 for s in svcs if s.get("status") in ["Selesai", "Sudah Diambil"])
+        laba = sum(s.get("profit", 0) or 0 for s in completed_svcs)
         modal = sum(s.get("sparepart_cost", 0) or 0 for s in svcs)
         title = "Laporan Keuangan"
         headers = ["Metrik", "Nilai"]
@@ -2058,7 +2226,8 @@ async def get_settings(user: dict = Depends(get_current_user)):
                 "print_header_address": "", "print_header_phone": "",
                 "print_footer_text": "Terima kasih telah menggunakan layanan kami.",
                 "label_header_title": "", "label_footer_text": "",
-                "qr_header_title": "", "qr_footer_text": ""}
+                "qr_header_title": "", "qr_footer_text": "",
+                "printout_settings": {}}
     s = await db.settings.find_one({"id": "main"}, {"_id": 0})
     if not s:
         await db.settings.insert_one(defaults)
@@ -2107,6 +2276,28 @@ async def reset_database(data: ResetDBIn, user: dict = Depends(require_roles("ow
     logger.warning(f"[RESET DB] by {user['name']} - counts: {counts}")
     return {"ok": True, "deleted_counts": counts, "message": "Database telah di-reset. Data default sudah dibuat ulang."}
 
+
+# ----------HEALT CHECK ----------
+@app.get("/health")
+async def health():
+    await client.admin.command("ping")
+    return {
+        "status": "healthy",
+        "database": "connected"
+    }
+
+# ---------- STARTUP EVENT ----------
+@app.on_event("startup")
+async def startup():
+    logger.info("Connecting to MongoDB...")
+    await client.admin.command("ping")
+    logger.info("MongoDB connected") 
+
+# ---------- SHUTDOWN EVENT ----------
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
+    
 # ---------- GLOBAL SEARCH ----------
 @api.get("/search")
 async def global_search(q: str, user: dict = Depends(get_current_user)):
@@ -2193,7 +2384,7 @@ async def render_wa_template(kind: str, service: dict, extra: dict = None) -> st
         "estimated_days": diag.get("estimated_days", "-"),
         "warranty_days": service.get("warranty_days", 0),
         "warranty_until": (service.get("warranty_until") or "")[:10],
-        "tracking_url": f"{os.environ.get('PUBLIC_APP_URL', '')}/track/{service.get('service_number', '')}",
+        "tracking_url": f"{(os.environ.get('PUBLIC_APP_URL') or 'https://final-service-manager.vercel.app').rstrip('/')}/track/{service.get('service_number', '')}",
     }
     if extra:
         ctx.update(extra)

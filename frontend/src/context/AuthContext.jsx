@@ -7,6 +7,8 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null); // null = checking, false = unauth, obj = authed
   const [error, setError] = useState("");
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     api.get("/auth/me").then((r) => setUser(r.data)).catch(() => setUser(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps

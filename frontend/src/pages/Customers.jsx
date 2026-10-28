@@ -25,7 +25,8 @@ export default function Customers() {
     const r = await api.get(`/customers?q=${encodeURIComponent(q)}`);
     setItems(r.data);
   };
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [q]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { load();  }, [q]);
 
   const save = async () => {
     try {

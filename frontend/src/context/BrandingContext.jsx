@@ -12,7 +12,10 @@ export function BrandingProvider({ children }) {
       setSettings(r.data || {});
     } catch (e) { /* not logged in yet */ }
   };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, []);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (settings.app_name) document.title = settings.app_name;
